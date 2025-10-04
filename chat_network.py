@@ -3,7 +3,9 @@ import os
 import base64
 import socket
 import threading
-from typing import Callable, Dict, List, Optional, Tuple
+import time
+from collections import deque
+from typing import Callable, Dict, List, Optional, Tuple, Set
 
 
 def _safe_json_dumps(payload: Dict[str, object]) -> bytes:
@@ -96,6 +98,20 @@ class ChatServer:
         # Listener username (optional, set by UI)
         self._server_username: str = ""
 
+        # Metrics
+        self._metrics_lock = threading.Lock()
+        self._messages_total: int = 0
+        self._bytes_total: int = 0
+        # Keep last 10 seconds of events (timestamp, bytes)
+        self._recent_events: "deque[Tuple[float, int]]" = deque()
+        self._start_time: float = time.monotonic()
+
+        # Additional filtering options
+        self._blocked_keywords: List[str] = []
+        self._allowed_types: Optional[Set[str]] = None  # None => allow all
+        self._max_message_length: Optional[int] = None
+        self._max_file_size_bytes: Optional[int] = None
+
     def start(self) -> None:
         if self._server_socket is not None:
             return
@@ -145,11 +161,15 @@ class ChatServer:
 
     def send_from_server(self, username: str, message: str) -> None:
         payload: Dict[str, object] = {"username": username, "message": message, "type": "text"}
+        # Apply filters
+        if not self._passes_filters(payload):
+            return
         # Local UI callback
         try:
             self._on_message(payload)
         except Exception:
             pass
+        self._record_message_metric(payload)
         # Broadcast to all clients
         self._broadcast(payload)
 
@@ -170,10 +190,13 @@ class ChatServer:
             "filesize": filesize,
             "filedata_b64": filedata_b64,
         }
+        if not self._passes_filters(payload):
+            return
         try:
             self._on_message(payload)
         except Exception:
             pass
+        self._record_message_metric(payload)
         self._broadcast(payload)
 
     # Internal methods
@@ -258,11 +281,15 @@ class ChatServer:
                             pass
                         break
 
+                    # Apply content/type filters
+                    if not self._passes_filters(obj):
+                        continue
                     # Notify UI and broadcast to all clients (including sender)
                     try:
                         self._on_message(obj)
                     except Exception:
                         pass
+                    self._record_message_metric(obj)
                     self._broadcast(obj)
         finally:
             try:
@@ -284,6 +311,7 @@ class ChatServer:
                 self._on_message(leave_payload)
             except Exception:
                 pass
+            self._record_message_metric(leave_payload)
             self._broadcast(leave_payload)
             # Update user list
             self._broadcast_userlist()
@@ -372,7 +400,127 @@ class ChatServer:
             self._on_message(payload)
         except Exception:
             pass
+        self._record_message_metric(payload)
         self._broadcast(payload)
+
+    # Filtering API
+    def set_blocked_keywords(self, keywords: List[str]) -> None:
+        self._blocked_keywords = [k.strip().lower() for k in (keywords or []) if k and k.strip()]
+
+    def set_allowed_message_types(self, types: Optional[List[str]]) -> None:
+        # None or empty => allow all
+        if not types:
+            self._allowed_types = None
+        else:
+            self._allowed_types = {t.strip().lower() for t in types if t and t.strip()}
+
+    def set_max_message_length(self, max_len: Optional[int]) -> None:
+        if max_len is None or (isinstance(max_len, int) and max_len <= 0):
+            self._max_message_length = None
+        else:
+            self._max_message_length = int(max_len)
+
+    def set_max_file_size_bytes(self, max_bytes: Optional[int]) -> None:
+        if max_bytes is None or (isinstance(max_bytes, int) and max_bytes <= 0):
+            self._max_file_size_bytes = None
+        else:
+            self._max_file_size_bytes = int(max_bytes)
+
+    def get_filters_snapshot(self) -> Dict[str, object]:
+        return {
+            "blocked_keywords": list(self._blocked_keywords),
+            "allowed_types": sorted(list(self._allowed_types)) if self._allowed_types is not None else None,
+            "max_message_length": self._max_message_length,
+            "max_file_size_bytes": self._max_file_size_bytes,
+        }
+
+    def _passes_filters(self, obj: Dict[str, object]) -> bool:
+        try:
+            msg_type = str(obj.get("type", "text")).strip().lower()
+        except Exception:
+            msg_type = "text"
+
+        # Allowed types
+        if self._allowed_types is not None and msg_type not in self._allowed_types:
+            return False
+
+        # Message content filters
+        if msg_type == "text":
+            try:
+                msg_text = str(obj.get("message", ""))
+            except Exception:
+                msg_text = ""
+            if self._max_message_length is not None and len(msg_text) > self._max_message_length:
+                return False
+            if self._blocked_keywords:
+                msg_lower = msg_text.lower()
+                for kw in self._blocked_keywords:
+                    if kw and kw in msg_lower:
+                        return False
+
+        # File filters
+        if msg_type == "file":
+            try:
+                file_size = int(obj.get("filesize", 0) or 0)
+            except Exception:
+                file_size = 0
+            if self._max_file_size_bytes is not None and file_size > self._max_file_size_bytes:
+                return False
+
+        return True
+
+    # Metrics API
+    def _record_message_metric(self, payload: Dict[str, object]) -> None:
+        data_len = len(_safe_json_dumps(payload))
+        now = time.monotonic()
+        with self._metrics_lock:
+            self._messages_total += 1
+            self._bytes_total += data_len
+            self._recent_events.append((now, data_len))
+            self._purge_old_events_locked(now)
+
+    def _purge_old_events_locked(self, now: Optional[float] = None) -> None:
+        if now is None:
+            now = time.monotonic()
+        # Keep last 10 seconds
+        cutoff = now - 10.0
+        while self._recent_events and self._recent_events[0][0] < cutoff:
+            self._recent_events.popleft()
+
+    def get_metrics_snapshot(self) -> Dict[str, object]:
+        now = time.monotonic()
+        with self._metrics_lock:
+            self._purge_old_events_locked(now)
+            events = list(self._recent_events)
+            # Compute rates for 1s and 10s windows
+            one_s_cutoff = now - 1.0
+            ten_s_cutoff = now - 10.0
+            msgs_last_1s = sum(1 for (ts, _b) in events if ts >= one_s_cutoff)
+            bytes_last_1s = sum(b for (ts, b) in events if ts >= one_s_cutoff)
+            msgs_last_10s = sum(1 for (ts, _b) in events if ts >= ten_s_cutoff)
+            bytes_last_10s = sum(b for (ts, b) in events if ts >= ten_s_cutoff)
+
+            uptime_seconds = max(0.0, now - self._start_time)
+            snapshot = {
+                "messages_total": self._messages_total,
+                "bytes_total": self._bytes_total,
+                "messages_per_second": float(msgs_last_1s),
+                "messages_per_second_10s_avg": float(msgs_last_10s / 10.0),
+                "kilobytes_per_second": float(bytes_last_1s) / 1024.0,
+                "kilobytes_per_second_10s_avg": float(bytes_last_10s) / 1024.0 / 10.0,
+                "active_connections": self._safe_clients_count(),
+                "connected_users": self._safe_users_count(),
+                "uptime_seconds": int(uptime_seconds),
+            }
+        return snapshot
+
+    def _safe_clients_count(self) -> int:
+        with self._clients_lock:
+            return len(self._clients)
+
+    def _safe_users_count(self) -> int:
+        with self._clients_lock:
+            return len(self._conn_to_username)
 
 
 class ChatClient:

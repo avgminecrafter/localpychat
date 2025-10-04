@@ -6,6 +6,7 @@ import socket
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from typing import Dict, Optional
+import time
 
 from chat_network import ChatClient, ChatServer
 
@@ -74,9 +75,32 @@ class ChatApp:
         ttk.Entry(admin, textvariable=self.block_ip_var, width=20).grid(row=1, column=1, sticky=tk.W)
         ttk.Button(admin, text="Block", command=self._block_ip).grid(row=1, column=2, padx=(8,8))
 
+        # Filters and stats columns
+        # Column 3-6: users
         ttk.Label(admin, text="Current Users:").grid(row=0, column=3, sticky=tk.W, padx=(24,4))
         self.user_listbox = tk.Listbox(admin, height=5, width=24)
-        self.user_listbox.grid(row=0, column=4, rowspan=2, sticky=tk.N+tk.S+tk.W, padx=(0,8), pady=4)
+        self.user_listbox.grid(row=0, column=4, rowspan=3, sticky=tk.N+tk.S+tk.W, padx=(0,8), pady=4)
+
+        # Column 6-10: filters
+        ttk.Label(admin, text="Blocked Keywords (comma)").grid(row=0, column=5, sticky=tk.W, padx=(8,4))
+        self.block_keywords_var = tk.StringVar()
+        ttk.Entry(admin, textvariable=self.block_keywords_var, width=24).grid(row=0, column=6, sticky=tk.W)
+        ttk.Button(admin, text="Apply", command=self._apply_block_keywords).grid(row=0, column=7, padx=(8,8))
+
+        ttk.Label(admin, text="Allowed Types").grid(row=1, column=5, sticky=tk.W, padx=(8,4))
+        self.allowed_types_var = tk.StringVar(value="text,file,join,leave,userlist")
+        ttk.Entry(admin, textvariable=self.allowed_types_var, width=24).grid(row=1, column=6, sticky=tk.W)
+        ttk.Button(admin, text="Apply", command=self._apply_allowed_types).grid(row=1, column=7, padx=(8,8))
+
+        ttk.Label(admin, text="Max Msg Len").grid(row=2, column=5, sticky=tk.W, padx=(8,4))
+        self.max_len_var = tk.StringVar(value="0")
+        ttk.Entry(admin, textvariable=self.max_len_var, width=10).grid(row=2, column=6, sticky=tk.W)
+        ttk.Button(admin, text="Apply", command=self._apply_max_len).grid(row=2, column=7, padx=(8,8))
+
+        ttk.Label(admin, text="Max File KB").grid(row=2, column=8, sticky=tk.W, padx=(8,4))
+        self.max_file_kb_var = tk.StringVar(value="0")
+        ttk.Entry(admin, textvariable=self.max_file_kb_var, width=10).grid(row=2, column=9, sticky=tk.W)
+        ttk.Button(admin, text="Apply", command=self._apply_max_file_kb).grid(row=2, column=10, padx=(8,8))
 
         bottom = ttk.Frame(top)
         bottom.pack(fill=tk.X)
@@ -91,6 +115,12 @@ class ChatApp:
 
         file_btn = ttk.Button(bottom, text="Send File", command=self._on_send_file)
         file_btn.pack(side=tk.RIGHT, padx=(4, 0), pady=(0, 8))
+
+        # Stats footer
+        stats = ttk.LabelFrame(top, text="Listener Stats")
+        stats.pack(fill=tk.X, pady=(0, 8))
+        self.stats_var = tk.StringVar(value="-")
+        ttk.Label(stats, textvariable=self.stats_var).pack(side=tk.LEFT, padx=8, pady=(0,8))
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -108,6 +138,8 @@ class ChatApp:
 
     def _schedule_poll(self) -> None:
         self.root.after(100, self._poll_incoming)
+        # Also schedule periodic stats refresh
+        self.root.after(1000, self._refresh_stats)
 
     def _poll_incoming(self) -> None:
         while True:
@@ -256,6 +288,82 @@ class ChatApp:
             return
         # join/leave/text fallback
         self._append_chat(f"{obj.get('username', '')}: {obj.get('message', '')}")
+
+    # Filters UI actions
+    def _apply_block_keywords(self) -> None:
+        if not self.network_server:
+            messagebox.showinfo("Info", "Filters only work in Listener mode.")
+            return
+        raw = self.block_keywords_var.get()
+        keywords = [k.strip() for k in (raw.split(",") if raw else []) if k.strip()]
+        try:
+            self.network_server.set_blocked_keywords(keywords)
+            self._append_chat(f"[Admin] Blocked keywords set: {', '.join(keywords) if keywords else '(none)'}")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def _apply_allowed_types(self) -> None:
+        if not self.network_server:
+            messagebox.showinfo("Info", "Filters only work in Listener mode.")
+            return
+        raw = self.allowed_types_var.get()
+        types = [t.strip() for t in (raw.split(",") if raw else []) if t.strip()]
+        try:
+            self.network_server.set_allowed_message_types(types if types else None)
+            self._append_chat(f"[Admin] Allowed types: {', '.join(types) if types else '(all)'}")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def _apply_max_len(self) -> None:
+        if not self.network_server:
+            messagebox.showinfo("Info", "Filters only work in Listener mode.")
+            return
+        raw = self.max_len_var.get().strip()
+        try:
+            max_len = int(raw)
+        except Exception:
+            messagebox.showerror("Error", "Max message length must be integer")
+            return
+        try:
+            self.network_server.set_max_message_length(max_len if max_len > 0 else None)
+            self._append_chat(f"[Admin] Max message length: {max_len if max_len > 0 else '(no limit)'}")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def _apply_max_file_kb(self) -> None:
+        if not self.network_server:
+            messagebox.showinfo("Info", "Filters only work in Listener mode.")
+            return
+        raw = self.max_file_kb_var.get().strip()
+        try:
+            max_kb = int(raw)
+        except Exception:
+            messagebox.showerror("Error", "Max file KB must be integer")
+            return
+        try:
+            self.network_server.set_max_file_size_bytes(max_kb * 1024 if max_kb > 0 else None)
+            self._append_chat(f"[Admin] Max file size: {max_kb if max_kb > 0 else '(no limit)'} KB")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    # Stats display
+    def _refresh_stats(self) -> None:
+        try:
+            if self.network_server:
+                snap = self.network_server.get_metrics_snapshot()
+                text = (
+                    f"Msgs/s: {snap['messages_per_second']:.0f} (10s avg {snap['messages_per_second_10s_avg']:.1f})  "
+                    f"KB/s: {snap['kilobytes_per_second']:.1f} (10s avg {snap['kilobytes_per_second_10s_avg']:.1f})  "
+                    f"Total msgs: {snap['messages_total']}  Uptime: {snap['uptime_seconds']}s  "
+                    f"Conns: {snap['active_connections']} Users: {snap['connected_users']}"
+                )
+                self.stats_var.set(text)
+            else:
+                self.stats_var.set("-")
+        except Exception:
+            self.stats_var.set("-")
+        # Reschedule
+        self.root.after(1000, self._refresh_stats)
 
     # Admin controls
     def _block_username(self) -> None:
