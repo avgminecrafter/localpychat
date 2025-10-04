@@ -31,6 +31,18 @@ Extended fields:
   - `filesize` (integer, bytes)
   - `filedata_b64` (base64 encoded file contents)
 
+### New features
+
+- Auto-reconnect: the client automatically reconnects with backoff when enabled.
+- LAN discovery: discover running listeners on the local network via UDP broadcast.
+- Message filters: listener can drop messages containing configured substrings.
+- UI improvements:
+  - Menu bar with File and View menus
+  - Theme chooser (ttk themes)
+  - Optional timestamps and sound notifications
+  - Status bar for connection status
+  - Save/Clear chat log
+
 ### Requirements
 
 - Python 3.8+
@@ -54,6 +66,12 @@ python3 app.py
    - Block usernames or IPs for this session.
    - View current connected users.
 
+Additional tips:
+
+- Use the "Discover" button to find listeners on your LAN; pick one to auto-fill host/port.
+- Enable "Auto-Reconnect" before connecting to retry on transient network loss.
+- Toggle timestamps and sound notifications from the View menu.
+
 Tips:
 - On the listener, using host `0.0.0.0` listens on all interfaces. Share your LAN IP with others.
 - Firewall rules may need to allow inbound/outbound traffic on the selected port.
@@ -65,5 +83,6 @@ Tips:
 - File contents are sent inline as base64; for large files, consider size limits.
 - The UI thread polls a queue to remain responsive.
 - Newline-delimited JSON allows robust parsing across TCP frames.
+ - UDP discovery uses broadcast on port 54545; some networks may block broadcast.
 
 

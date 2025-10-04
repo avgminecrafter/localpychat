@@ -3,7 +3,12 @@ import os
 import base64
 import socket
 import threading
+import time
 from typing import Callable, Dict, List, Optional, Tuple
+
+# UDP discovery settings
+DISCOVERY_PORT: int = 54545
+DISCOVERY_MAGIC: str = "LAN_CHAT_DISCOVERY_V1"
 
 
 def _safe_json_dumps(payload: Dict[str, object]) -> bytes:
@@ -93,8 +98,12 @@ class ChatServer:
         # Session-scoped controls
         self._blocked_ips: List[str] = []
         self._blocked_usernames: List[str] = []
+        self._message_filters: List[str] = []
         # Listener username (optional, set by UI)
         self._server_username: str = ""
+        # UDP discovery responder
+        self._udp_socket: Optional[socket.socket] = None
+        self._udp_thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
         if self._server_socket is not None:
@@ -109,9 +118,12 @@ class ChatServer:
 
         self._accept_thread = threading.Thread(target=self._accept_loop, name="ChatServerAccept", daemon=True)
         self._accept_thread.start()
+        # Start UDP discovery responder
+        self._start_udp_discovery_responder()
 
     def stop(self) -> None:
         self._stop_event.set()
+        self._stop_udp_discovery_responder()
         if self._server_socket is not None:
             try:
                 self._server_socket.close()
@@ -204,6 +216,11 @@ class ChatServer:
                 continue
 
             conn.settimeout(0.5)
+            # Enable TCP keepalive to improve connection stability
+            try:
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            except Exception:
+                pass
             with self._clients_lock:
                 self._clients.append(conn)
                 if peer_ip:
@@ -257,6 +274,11 @@ class ChatServer:
                         except Exception:
                             pass
                         break
+
+                    # Message content filtering (server-side)
+                    if self._should_drop_message(obj):
+                        # Silently drop filtered content
+                        continue
 
                     # Notify UI and broadcast to all clients (including sender)
                     try:
@@ -330,6 +352,28 @@ class ChatServer:
             self._blocked_usernames.append(username_l)
         self._kick_blocked_connections()
 
+    def set_message_filters(self, filters: List[str]) -> None:
+        """Set substring filters for message content (case-insensitive)."""
+        normalized = []
+        for f in filters:
+            try:
+                s = str(f).strip().lower()
+            except Exception:
+                continue
+            if s:
+                normalized.append(s)
+        self._message_filters = normalized
+
+    def add_message_filter(self, filter_text: str) -> None:
+        """Add a single substring filter for message content."""
+        if not isinstance(filter_text, str):
+            return
+        s = filter_text.strip().lower()
+        if not s:
+            return
+        if s not in self._message_filters:
+            self._message_filters.append(s)
+
     def get_current_users(self) -> List[str]:
         with self._clients_lock:
             return list(self._conn_to_username.values())
@@ -374,6 +418,93 @@ class ChatServer:
             pass
         self._broadcast(payload)
 
+    # Filtering helper
+    def _should_drop_message(self, obj: Dict[str, object]) -> bool:
+        try:
+            message_text = str(obj.get("message", ""))
+        except Exception:
+            return False
+        if not message_text or not self._message_filters:
+            return False
+        message_lower = message_text.lower()
+        for substring in self._message_filters:
+            if substring and substring in message_lower:
+                return True
+        return False
+
+    # UDP discovery
+    def _start_udp_discovery_responder(self) -> None:
+        if self._udp_socket is not None:
+            return
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            except Exception:
+                pass
+            s.bind(("", DISCOVERY_PORT))
+            s.settimeout(0.5)
+            self._udp_socket = s
+        except Exception:
+            self._udp_socket = None
+            return
+        self._udp_thread = threading.Thread(target=self._udp_respond_loop, name="ChatServerUDP", daemon=True)
+        self._udp_thread.start()
+
+    def _stop_udp_discovery_responder(self) -> None:
+        if self._udp_socket is not None:
+            try:
+                self._udp_socket.close()
+            except Exception:
+                pass
+            self._udp_socket = None
+        if self._udp_thread is not None and self._udp_thread.is_alive():
+            try:
+                self._udp_thread.join(timeout=1.5)
+            except Exception:
+                pass
+        self._udp_thread = None
+
+    def _udp_respond_loop(self) -> None:
+        assert self._udp_socket is not None
+        s = self._udp_socket
+        while not self._stop_event.is_set():
+            try:
+                data, addr = s.recvfrom(2048)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            except Exception:
+                continue
+            try:
+                text = data.decode("utf-8", errors="ignore").strip()
+            except Exception:
+                text = ""
+            is_discovery = False
+            if text == DISCOVERY_MAGIC:
+                is_discovery = True
+            else:
+                try:
+                    obj = json.loads(text)
+                    if isinstance(obj, dict) and obj.get("discovery") == DISCOVERY_MAGIC:
+                        is_discovery = True
+                except Exception:
+                    is_discovery = False
+            if not is_discovery:
+                continue
+            # Reply with JSON. Client should use the source IP of this UDP reply
+            response = {
+                "discovery": "OK",
+                "port": self.port,
+                "name": self._server_username or "Listener",
+            }
+            try:
+                s.sendto(json.dumps(response).encode("utf-8"), addr)
+            except Exception:
+                continue
+
 
 class ChatClient:
     """TCP chat client for sending/receiving newline-delimited JSON messages."""
@@ -387,16 +518,16 @@ class ChatClient:
         self._socket: Optional[socket.socket] = None
         self._recv_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        self._auto_reconnect_enabled: bool = False
+        self._reconnect_initial_delay: float = 0.5
+        self._reconnect_max_delay: float = 8.0
 
     def connect(self) -> None:
         if self._socket is not None:
             return
         self._stop_event.clear()
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(5.0)
-        s.connect((self.host, self.port))
-        s.settimeout(0.5)
-        self._socket = s
+        if not self._connect_socket():
+            raise ConnectionError("Failed to connect to server")
         self._recv_thread = threading.Thread(target=self._recv_loop, name="ChatClientRecv", daemon=True)
         self._recv_thread.start()
         # Announce join
@@ -451,35 +582,151 @@ class ChatClient:
 
     # Internal
     def _recv_loop(self) -> None:
-        assert self._socket is not None
-        s = self._socket
         buffer = ""
-        try:
-            while not self._stop_event.is_set():
-                try:
-                    data = s.recv(4096)
-                except socket.timeout:
-                    continue
-                except OSError:
+        while not self._stop_event.is_set():
+            s = self._socket
+            if s is None:
+                # Attempt to reconnect if enabled, otherwise exit
+                if not self._auto_reconnect_enabled:
                     break
-                if not data:
+                if not self._attempt_reconnect_loop():
+                    # Stop requested during attempts
                     break
-                try:
-                    chunk = data.decode("utf-8", errors="ignore")
-                except Exception:
-                    continue
-                buffer += chunk
-                messages, buffer = _extract_json_lines_from_buffer(buffer)
-                for obj in messages:
-                    try:
-                        self._on_message(obj)
-                    except Exception:
-                        pass
-        finally:
+                # On success, send join announcement
+                self._send_payload({
+                    "type": "join",
+                    "username": self.username,
+                    "message": f"{self.username} rejoined the chat",
+                })
+                buffer = ""
+                continue
             try:
-                s.close()
+                data = s.recv(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                # Socket closed, treat as disconnect
+                try:
+                    s.close()
+                except Exception:
+                    pass
+                self._socket = None
+                continue
+            if not data:
+                # Remote closed
+                try:
+                    s.close()
+                except Exception:
+                    pass
+                self._socket = None
+                continue
+            try:
+                chunk = data.decode("utf-8", errors="ignore")
+            except Exception:
+                continue
+            buffer += chunk
+            messages, buffer = _extract_json_lines_from_buffer(buffer)
+            for obj in messages:
+                try:
+                    self._on_message(obj)
+                except Exception:
+                    pass
+
+    def _connect_socket(self) -> bool:
+        """Open and assign a TCP socket connection. Returns True on success."""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(5.0)
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             except Exception:
                 pass
+            s.connect((self.host, self.port))
+            s.settimeout(0.5)
+            self._socket = s
+            return True
+        except Exception:
+            try:
+                s.close()  # type: ignore[name-defined]
+            except Exception:
+                pass
+            self._socket = None
+            return False
+
+    def enable_auto_reconnect(self, enabled: bool) -> None:
+        self._auto_reconnect_enabled = bool(enabled)
+
+    def _attempt_reconnect_loop(self) -> bool:
+        """Try to reconnect with backoff until success or stop_event set. Returns True if reconnected."""
+        delay = self._reconnect_initial_delay
+        while not self._stop_event.is_set() and self._auto_reconnect_enabled and self._socket is None:
+            # Inform UI about attempt
+            try:
+                self._on_message({
+                    "type": "text",
+                    "username": "System",
+                    "message": f"Reconnecting in {delay:.1f}s...",
+                })
+            except Exception:
+                pass
+            time.sleep(delay)
+            if self._stop_event.is_set() or not self._auto_reconnect_enabled:
+                break
+            if self._connect_socket():
+                try:
+                    self._on_message({
+                        "type": "text",
+                        "username": "System",
+                        "message": "Reconnected to server",
+                    })
+                except Exception:
+                    pass
+                return True
+            delay = min(self._reconnect_max_delay, delay * 1.5)
+        return False
+
+    @staticmethod
+    def discover_servers(timeout: float = 1.2) -> List[Dict[str, object]]:
+        """Broadcast UDP discovery and collect server responses for a short period."""
+        results: List[Dict[str, object]] = []
+        seen: set[Tuple[str, int]] = set()
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            sock.settimeout(0.3)
+        except Exception:
+            return results
+        try:
+            end_time = time.time() + timeout
+            payload = json.dumps({"discovery": DISCOVERY_MAGIC}).encode("utf-8")
+            try:
+                sock.sendto(payload, ("255.255.255.255", DISCOVERY_PORT))
+            except Exception:
+                pass
+            while time.time() < end_time:
+                try:
+                    data, addr = sock.recvfrom(2048)
+                except socket.timeout:
+                    continue
+                except Exception:
+                    break
+                host = addr[0]
+                try:
+                    obj = json.loads(data.decode("utf-8", errors="ignore"))
+                except Exception:
+                    obj = {}
+                port = int(obj.get("port", 0) or 0)
+                name = str(obj.get("name", "Listener"))
+                key = (host, port)
+                if port and key not in seen:
+                    seen.add(key)
+                    results.append({"host": host, "port": port, "name": name})
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        return results
 
     def _send_payload(self, payload: Dict[str, object]) -> None:
         if self._socket is None:
