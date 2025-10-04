@@ -8,6 +8,7 @@ from tkinter import ttk, messagebox, filedialog
 from typing import Dict, Optional
 
 from chat_network import ChatClient, ChatServer
+from crypto_utils import decrypt_bytes, ALG_IDENTIFIER
 
 
 class ChatApp:
@@ -52,6 +53,18 @@ class ChatApp:
 
         self.toggle_btn = ttk.Button(conn, text="Start Listening", command=self._on_toggle)
         self.toggle_btn.grid(row=0, column=8, padx=(16, 8))
+
+        # Encryption controls
+        ttk.Label(conn, text="Passphrase:").grid(row=1, column=0, sticky=tk.W, padx=(8, 4))
+        self.passphrase_var = tk.StringVar()
+        self.show_enc_var = tk.BooleanVar(value=False)
+        self.encrypt_enabled_var = tk.BooleanVar(value=False)
+        self.pass_entry = ttk.Entry(conn, textvariable=self.passphrase_var, width=24, show="*")
+        self.pass_entry.grid(row=1, column=1, columnspan=2, sticky=tk.W)
+        self.show_cb = ttk.Checkbutton(conn, text="Show", variable=self.show_enc_var, command=self._toggle_show_pass)
+        self.show_cb.grid(row=1, column=3, sticky=tk.W)
+        self.encrypt_cb = ttk.Checkbutton(conn, text="Encrypt messages/files", variable=self.encrypt_enabled_var)
+        self.encrypt_cb.grid(row=1, column=4, columnspan=3, sticky=tk.W)
 
         # Chat frame
         chat = ttk.LabelFrame(top, text="Chat")
@@ -177,10 +190,12 @@ class ChatApp:
         if not text:
             return
         username = self.username_var.get().strip() or "User"
+        encrypt = bool(self.encrypt_enabled_var.get()) and bool(self.passphrase_var.get())
+        passphrase = self.passphrase_var.get() if encrypt else None
         if self.network_server:
-            self.network_server.send_from_server(username=username, message=text)
+            self.network_server.send_from_server(username=username, message=text, encrypt=encrypt, passphrase=passphrase)
         elif self.network_client:
-            self.network_client.send_message(text, username=username)
+            self.network_client.send_message(text, username=username, encrypt=encrypt, passphrase=passphrase)
         else:
             self._append_chat("[System] Not connected")
         self.entry_var.set("")
@@ -190,14 +205,16 @@ class ChatApp:
         if not path:
             return
         username = self.username_var.get().strip() or "User"
+        encrypt = bool(self.encrypt_enabled_var.get()) and bool(self.passphrase_var.get())
+        passphrase = self.passphrase_var.get() if encrypt else None
         if self.network_server:
             try:
-                self.network_server.send_file_from_server(username=username, file_path=path)
+                self.network_server.send_file_from_server(username=username, file_path=path, encrypt=encrypt, passphrase=passphrase)
             except Exception as e:
                 messagebox.showerror("File Send Error", str(e))
         elif self.network_client:
             try:
-                self.network_client.send_file(path, username=username)
+                self.network_client.send_file(path, username=username, encrypt=encrypt, passphrase=passphrase)
             except Exception as e:
                 messagebox.showerror("File Send Error", str(e))
         else:
@@ -218,6 +235,12 @@ class ChatApp:
                         payload[key] = obj[key]
             if payload.get("type") == "userlist" and isinstance(obj.get("users"), list):
                 payload["users"] = obj["users"]
+            # Preserve encryption fields if present
+            if bool(obj.get("enc")):
+                payload["enc"] = True
+                for key in ("enc_alg", "ciphertext_b64", "nonce_b64", "salt_b64"):
+                    if key in obj:
+                        payload[key] = obj[key]
         except Exception:
             return
         self.incoming_queue.put(payload)
@@ -232,15 +255,35 @@ class ChatApp:
             save_dir = os.path.join(os.path.expanduser("~"), "Downloads")
             os.makedirs(save_dir, exist_ok=True)
             safe_name = filename or "received_file"
-            dest_path = os.path.join(save_dir, safe_name)
+            is_encrypted = bool(obj.get("enc")) and obj.get("enc_alg") == ALG_IDENTIFIER
+            dest_filename = safe_name
+            dest_path = os.path.join(save_dir, dest_filename)
             try:
                 if isinstance(b64, str):
                     data = base64.b64decode(b64)
                 else:
                     data = b""
+                # Attempt decryption if marked encrypted and we have a passphrase
+                decrypted_ok = False
+                if is_encrypted:
+                    try:
+                        passphrase = self.passphrase_var.get()
+                        if passphrase:
+                            nonce_b64 = str(obj.get("nonce_b64", ""))
+                            salt_b64 = str(obj.get("salt_b64", ""))
+                            plaintext = decrypt_bytes(base64.b64encode(data).decode("ascii"), nonce_b64, salt_b64, passphrase)
+                            data = plaintext
+                            decrypted_ok = True
+                    except Exception:
+                        pass
+                if is_encrypted and not decrypted_ok:
+                    # Save ciphertext with .enc suffix
+                    dest_filename = f"{safe_name}.enc"
+                    dest_path = os.path.join(save_dir, dest_filename)
                 with open(dest_path, "wb") as f:
                     f.write(data)
-                self._append_chat(f"[File] {username} -> saved to {dest_path} ({len(data)} bytes)")
+                suffix_note = " (encrypted, .enc)" if (is_encrypted and not decrypted_ok) else ""
+                self._append_chat(f"[File] {username} -> saved to {dest_path}{suffix_note} ({len(data)} bytes)")
             except Exception as e:
                 self._append_chat(f"[File] Error saving file {safe_name}: {e}")
             return
@@ -254,8 +297,20 @@ class ChatApp:
             except Exception:
                 pass
             return
-        # join/leave/text fallback
-        self._append_chat(f"{obj.get('username', '')}: {obj.get('message', '')}")
+        # join/leave/text fallback with decryption
+        message_text = str(obj.get("message", ""))
+        if obj.get("enc") and obj.get("enc_alg") == ALG_IDENTIFIER:
+            try:
+                passphrase = self.passphrase_var.get()
+                if passphrase:
+                    ciphertext_b64 = str(obj.get("ciphertext_b64", ""))
+                    nonce_b64 = str(obj.get("nonce_b64", ""))
+                    salt_b64 = str(obj.get("salt_b64", ""))
+                    plaintext = decrypt_bytes(ciphertext_b64, nonce_b64, salt_b64, passphrase)
+                    message_text = plaintext.decode("utf-8", errors="replace")
+            except Exception:
+                pass
+        self._append_chat(f"{obj.get('username', '')}: {message_text}")
 
     # Admin controls
     def _block_username(self) -> None:
@@ -302,6 +357,15 @@ class ChatApp:
     def _on_close(self) -> None:
         self._disconnect()
         self.root.destroy()
+
+    def _toggle_show_pass(self) -> None:
+        try:
+            if self.show_enc_var.get():
+                self.pass_entry.configure(show="")
+            else:
+                self.pass_entry.configure(show="*")
+        except Exception:
+            pass
 
 
 def main() -> None:

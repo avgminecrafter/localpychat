@@ -5,6 +5,8 @@ import socket
 import threading
 from typing import Callable, Dict, List, Optional, Tuple
 
+from crypto_utils import ALG_IDENTIFIER, encrypt_bytes
+
 
 def _safe_json_dumps(payload: Dict[str, object]) -> bytes:
     """Serialize payload to UTF-8 bytes with newline delimiter.
@@ -23,6 +25,12 @@ def _safe_json_dumps(payload: Dict[str, object]) -> bytes:
     # Optional file fields
     if data.get("type") == "file":
         for key in ("filename", "filesize", "filedata_b64"):
+            if key in payload:
+                data[key] = payload[key]
+    # Optional encryption fields
+    if bool(payload.get("enc")):
+        data["enc"] = True
+        for key in ("enc_alg", "ciphertext_b64", "nonce_b64", "salt_b64"):
             if key in payload:
                 data[key] = payload[key]
     # Optional user list broadcast
@@ -61,6 +69,12 @@ def _extract_json_lines_from_buffer(buffer: str) -> Tuple[List[Dict[str, object]
                             clean[key] = obj[key]
                 if clean.get("type") == "userlist" and isinstance(obj.get("users"), list):
                     clean["users"] = obj["users"]
+                # Preserve encryption-related fields if present
+                if bool(obj.get("enc")):
+                    clean["enc"] = True
+                    for key in ("enc_alg", "ciphertext_b64", "nonce_b64", "salt_b64"):
+                        if key in obj:
+                            clean[key] = obj[key]
                 messages.append(clean)
         except json.JSONDecodeError:
             # Ignore malformed JSON lines
@@ -143,8 +157,22 @@ class ChatServer:
             self._clients.clear()
         self._client_threads.clear()
 
-    def send_from_server(self, username: str, message: str) -> None:
+    def send_from_server(self, username: str, message: str, *, encrypt: bool = False, passphrase: Optional[str] = None) -> None:
         payload: Dict[str, object] = {"username": username, "message": message, "type": "text"}
+        if encrypt and passphrase:
+            try:
+                ciphertext_b64, nonce_b64, salt_b64 = encrypt_bytes(message.encode("utf-8"), passphrase)
+                payload.update({
+                    "enc": True,
+                    "enc_alg": ALG_IDENTIFIER,
+                    "ciphertext_b64": ciphertext_b64,
+                    "nonce_b64": nonce_b64,
+                    "salt_b64": salt_b64,
+                    "message": "[encrypted]",
+                })
+            except Exception:
+                # Fallback to plaintext if encryption fails
+                pass
         # Local UI callback
         try:
             self._on_message(payload)
@@ -153,7 +181,7 @@ class ChatServer:
         # Broadcast to all clients
         self._broadcast(payload)
 
-    def send_file_from_server(self, username: str, file_path: str) -> None:
+    def send_file_from_server(self, username: str, file_path: str, *, encrypt: bool = False, passphrase: Optional[str] = None) -> None:
         try:
             with open(file_path, "rb") as f:
                 data_bytes = f.read()
@@ -161,7 +189,23 @@ class ChatServer:
             return
         filename = os.path.basename(file_path)
         filesize = len(data_bytes)
-        filedata_b64 = base64.b64encode(data_bytes).decode("ascii")
+        # Optionally encrypt file bytes
+        if encrypt and passphrase:
+            try:
+                ciphertext_b64, nonce_b64, salt_b64 = encrypt_bytes(data_bytes, passphrase)
+                filedata_b64 = ciphertext_b64
+                enc_fields = {
+                    "enc": True,
+                    "enc_alg": ALG_IDENTIFIER,
+                    "nonce_b64": nonce_b64,
+                    "salt_b64": salt_b64,
+                }
+            except Exception:
+                filedata_b64 = base64.b64encode(data_bytes).decode("ascii")
+                enc_fields = {}
+        else:
+            filedata_b64 = base64.b64encode(data_bytes).decode("ascii")
+            enc_fields = {}
         payload: Dict[str, object] = {
             "type": "file",
             "username": username,
@@ -170,6 +214,7 @@ class ChatServer:
             "filesize": filesize,
             "filedata_b64": filedata_b64,
         }
+        payload.update(enc_fields)
         try:
             self._on_message(payload)
         except Exception:
@@ -422,13 +467,27 @@ class ChatClient:
             self._recv_thread.join(timeout=1.5)
         self._recv_thread = None
 
-    def send_message(self, message: str, username: Optional[str] = None) -> None:
+    def send_message(self, message: str, username: Optional[str] = None, *, encrypt: bool = False, passphrase: Optional[str] = None) -> None:
         if self._socket is None:
             return
         payload: Dict[str, object] = {"type": "text", "username": username or self.username, "message": message}
+        if encrypt and passphrase:
+            try:
+                ciphertext_b64, nonce_b64, salt_b64 = encrypt_bytes(message.encode("utf-8"), passphrase)
+                payload.update({
+                    "enc": True,
+                    "enc_alg": ALG_IDENTIFIER,
+                    "ciphertext_b64": ciphertext_b64,
+                    "nonce_b64": nonce_b64,
+                    "salt_b64": salt_b64,
+                    "message": "[encrypted]",
+                })
+            except Exception:
+                # If encryption fails, fall back to plaintext
+                pass
         self._send_payload(payload)
 
-    def send_file(self, file_path: str, username: Optional[str] = None) -> None:
+    def send_file(self, file_path: str, username: Optional[str] = None, *, encrypt: bool = False, passphrase: Optional[str] = None) -> None:
         if self._socket is None:
             return
         try:
@@ -438,7 +497,23 @@ class ChatClient:
             return
         filename = os.path.basename(file_path)
         filesize = len(data_bytes)
-        filedata_b64 = base64.b64encode(data_bytes).decode("ascii")
+        # Optionally encrypt file bytes
+        if encrypt and passphrase:
+            try:
+                ciphertext_b64, nonce_b64, salt_b64 = encrypt_bytes(data_bytes, passphrase)
+                filedata_b64 = ciphertext_b64
+                enc_fields = {
+                    "enc": True,
+                    "enc_alg": ALG_IDENTIFIER,
+                    "nonce_b64": nonce_b64,
+                    "salt_b64": salt_b64,
+                }
+            except Exception:
+                filedata_b64 = base64.b64encode(data_bytes).decode("ascii")
+                enc_fields = {}
+        else:
+            filedata_b64 = base64.b64encode(data_bytes).decode("ascii")
+            enc_fields = {}
         payload: Dict[str, object] = {
             "type": "file",
             "username": username or self.username,
@@ -447,6 +522,7 @@ class ChatClient:
             "filesize": filesize,
             "filedata_b64": filedata_b64,
         }
+        payload.update(enc_fields)
         self._send_payload(payload)
 
     # Internal
