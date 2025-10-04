@@ -34,6 +34,7 @@ Extended fields:
 ### Requirements
 
 - Python 3.8+
+- Dependencies: install with `pip install -r requirements.txt`
 
 ### Run
 
@@ -65,5 +66,15 @@ Tips:
 - File contents are sent inline as base64; for large files, consider size limits.
 - The UI thread polls a queue to remain responsive.
 - Newline-delimited JSON allows robust parsing across TCP frames.
+
+### End-to-end Encryption (optional)
+
+- Enable encryption by checking "Encrypt messages/files" and setting a passphrase.
+- Uses libsodium SecretBox (XSalsa20-Poly1305) with Argon2id key derivation.
+- Encrypted payload fields:
+  - For text: `enc: true`, `enc_alg: "nacl-secretbox-v1"`, `ciphertext_b64`, `nonce_b64`, `salt_b64`.
+  - For files: same flags with `filedata_b64` containing ciphertext.
+- The server relays payloads without decryption.
+- Receivers must use the same passphrase to decrypt.
 
 
